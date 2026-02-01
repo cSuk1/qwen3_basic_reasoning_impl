@@ -10,6 +10,7 @@ import json
 import torch.nn as nn
 import torch
 from importlib.metadata import version
+import argparse
 
 MODEL_CONFIG_PATH = Path(__file__).parent / "model_config.json"
 
@@ -863,7 +864,7 @@ class Qwen3Tokenizer:
         if repo_id and "Base" not in repo_id:
             eos_token = "<|im_end|>"
         else:
-            eos_token = "\<|endoftext|\>"
+            eos_token = "<|endoftext|>"
         if eos_token in self._special_to_id:
             self.eos_token_id = self._special_to_id[eos_token]
 
@@ -1233,17 +1234,42 @@ def main(model_name: str = "0.6B",
 
 
 if __name__ == "__main__":
-    # 配置参数 - 可以修改这些参数来选择不同的模型和模式
-    CHOOSE_MODEL = "0.6B"  # 可选: "0.6B", "1.7B", "4B", "8B", "14B", "32B"
-    USE_BASE_MODEL = False      # 使用基础模型
-    USE_REASONING_MODEL = True  # 使用推理模型
-    USE_INSTRUCT_MODEL = False  # 使用指令模型
-    USE_MULTI_TURN = True       # 使用多轮对话模式
+    parser = argparse.ArgumentParser(description='Qwen3模型基础实现')
+    parser.add_argument('--model_name', type=str, default='0.6B',
+                        help='模型名称，支持: 0.6B, 1.7B, 4B, 8B, 14B, 32B (默认: 0.6B)')
+    parser.add_argument('--use_base_model', action='store_true',
+                        help='使用基础模型 (默认使用推理模型)')
+    parser.add_argument('--use_reasoning_model', action='store_true', default=True,
+                        help='使用推理模型 (默认)')
+    parser.add_argument('--use_instruct_model', action='store_true',
+                        help='使用指令模型')
+    parser.add_argument('--max_new_tokens', type=int, default=768,
+                        help='最大生成token数 (默认: 768)')
+    parser.add_argument('--multi_turn', action='store_true', default=True,
+                        help='启用多轮对话模式 (默认启用)')
+
+    args = parser.parse_args()
+
+    # 根据命令行参数设置模型类型
+    if args.use_base_model:
+        use_base_model = True
+        use_reasoning_model = False
+        use_instruct_model = False
+    elif args.use_instruct_model:
+        use_base_model = False
+        use_reasoning_model = False
+        use_instruct_model = True
+    else:
+        # 默认使用推理模型
+        use_base_model = False
+        use_reasoning_model = True
+        use_instruct_model = False
+
     model, tokenizer, config, device = main(
-        model_name=CHOOSE_MODEL,
-        use_base_model=USE_BASE_MODEL,
-        use_reasoning_model=USE_REASONING_MODEL,
-        use_instruct_model=USE_INSTRUCT_MODEL,
-        max_new_tokens=1024,
-        is_support_conversation_history=USE_MULTI_TURN
+        model_name=args.model_name,
+        use_base_model=use_base_model,
+        use_reasoning_model=use_reasoning_model,
+        use_instruct_model=use_instruct_model,
+        max_new_tokens=args.max_new_tokens,
+        is_support_conversation_history=args.multi_turn
     )
