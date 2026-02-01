@@ -1,72 +1,16 @@
 # -*- coding: utf-8 -*-
-"""
-Qwen3基础模型实现
+from tokenizers import Tokenizer
+import re
+from huggingface_hub import hf_hub_download, snapshot_download
+from safetensors.torch import load_file
+from pathlib import Path
+import os
+import json
+import torch.nn as nn
+import torch
+from importlib.metadata import version
 
-本文件实现了Qwen3大语言模型的完整架构，包括：
-1. 模型架构定义（Transformer块、注意力机制、前馈网络等）
-2. 模型初始化与配置加载
-3. 预训练权重下载与加载
-4. 分词器实现
-5. 文本生成功能
-
-作者：基于开源Qwen3模型实现
-版本：1.0
-"""
-
-# ============================================================================
-# 1. 导入依赖库
-# ============================================================================
-
-# 分词器相关
-from tokenizers import Tokenizer  # HuggingFace分词器库
-import re  # 正则表达式，用于分词器中的特殊token分割
-
-# 模型权重下载相关
-from huggingface_hub import hf_hub_download, snapshot_download  # HuggingFace Hub下载工具
-from safetensors.torch import load_file  # 安全张量文件加载
-
-# 文件系统与路径操作
-from pathlib import Path  # 现代化路径操作
-import os  # 操作系统接口
-import json  # JSON格式处理
-
-# PyTorch深度学习框架
-import torch.nn as nn  # 神经网络模块
-import torch  # PyTorch核心库
-
-# 包版本检查
-from importlib.metadata import version  # 获取包版本信息
-
-# ============================================================================
-# 2. 配置文件路径定义
-# ============================================================================
-
-# 模型配置文件路径 - 位于与当前文件相同的目录下
 MODEL_CONFIG_PATH = Path(__file__).parent / "model_config.json"
-
-# ============================================================================
-# 3. 包版本检查（确保依赖库版本兼容性）
-# ============================================================================
-
-# 必需依赖包列表
-pkgs = [
-    "huggingface_hub",  # to download pretrained weights
-    "tokenizers",       # to implement the tokenizer
-    "torch",            # to implement the model
-]
-for p in pkgs:
-    print(f"{p} version: {version(p)}")
-# Select which model to use via the following flag; only one can be True
-
-USE_BASE_MODEL = False
-USE_REASONING_MODEL = True
-USE_INSTRUCT_MODEL = False
-
-if (USE_BASE_MODEL + USE_REASONING_MODEL
-        + USE_INSTRUCT_MODEL) != 1:
-    raise AttributeError("Only one of the options above can be True.")
-
-# # 1. Architecture code
 
 
 class FeedForward(nn.Module):
@@ -479,7 +423,6 @@ class Qwen3Model(nn.Module):
         return logits
 
 
-# # 2. Initialize model
 def load_model_config(model_name: str, config_path: str = None) -> dict:
     """
     从JSON配置文件加载模型配置
@@ -692,7 +635,6 @@ def model_memory_size(model, input_dtype=torch.float32):
     return total_memory_gb
 
 
-# # 4. Load pretrained weights
 def load_weights_into_qwen(model, param_config, params):
     """
     将预训练权重加载到Qwen3模型中
@@ -884,7 +826,6 @@ def download_and_load_weights(model: Qwen3Model, config: dict, model_name: str,
     return repo_id, local_dir
 
 
-# # 4. Load tokenizer
 class Qwen3Tokenizer:
     """Qwen3分词器"""
     _SPECIALS = [
@@ -1017,7 +958,6 @@ def load_tokenizer(model_name: str, repo_id: str, local_dir: str,
     return tokenizer
 
 
-# # 5. Generate text
 def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
     """
     流式生成文本，以token-by-token方式生成模型响应
@@ -1117,7 +1057,6 @@ def generate_response(model: Qwen3Model, tokenizer: Qwen3Tokenizer,
     print("\n")
 
 
-# # 6. Main function
 def main(model_name: str = "4B",
          use_base_model: bool = False,
          use_reasoning_model: bool = True,
@@ -1210,7 +1149,7 @@ if __name__ == "__main__":
     USE_INSTRUCT_MODEL = False  # 使用指令模型
 
     # 用户输入提示
-    PROMPT = input("Enter your prompt: ")  # 或者直接设置: PROMPT = "你好"
+    PROMPT = input("Enter your prompt: ")
 
     # 运行主函数
     model, tokenizer, config, device = main(
