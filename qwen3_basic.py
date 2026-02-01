@@ -1,0 +1,1223 @@
+# -*- coding: utf-8 -*-
+"""
+Qwen3基础模型实现
+
+本文件实现了Qwen3大语言模型的完整架构，包括：
+1. 模型架构定义（Transformer块、注意力机制、前馈网络等）
+2. 模型初始化与配置加载
+3. 预训练权重下载与加载
+4. 分词器实现
+5. 文本生成功能
+
+作者：基于开源Qwen3模型实现
+版本：1.0
+"""
+
+# ============================================================================
+# 1. 导入依赖库
+# ============================================================================
+
+# 分词器相关
+from tokenizers import Tokenizer  # HuggingFace分词器库
+import re  # 正则表达式，用于分词器中的特殊token分割
+
+# 模型权重下载相关
+from huggingface_hub import hf_hub_download, snapshot_download  # HuggingFace Hub下载工具
+from safetensors.torch import load_file  # 安全张量文件加载
+
+# 文件系统与路径操作
+from pathlib import Path  # 现代化路径操作
+import os  # 操作系统接口
+import json  # JSON格式处理
+
+# PyTorch深度学习框架
+import torch.nn as nn  # 神经网络模块
+import torch  # PyTorch核心库
+
+# 包版本检查
+from importlib.metadata import version  # 获取包版本信息
+
+# ============================================================================
+# 2. 配置文件路径定义
+# ============================================================================
+
+# 模型配置文件路径 - 位于与当前文件相同的目录下
+MODEL_CONFIG_PATH = Path(__file__).parent / "model_config.json"
+
+# ============================================================================
+# 3. 包版本检查（确保依赖库版本兼容性）
+# ============================================================================
+
+# 必需依赖包列表
+pkgs = [
+    "huggingface_hub",  # to download pretrained weights
+    "tokenizers",       # to implement the tokenizer
+    "torch",            # to implement the model
+]
+for p in pkgs:
+    print(f"{p} version: {version(p)}")
+# Select which model to use via the following flag; only one can be True
+
+USE_BASE_MODEL = False
+USE_REASONING_MODEL = True
+USE_INSTRUCT_MODEL = False
+
+if (USE_BASE_MODEL + USE_REASONING_MODEL
+        + USE_INSTRUCT_MODEL) != 1:
+    raise AttributeError("Only one of the options above can be True.")
+
+# # 1. Architecture code
+
+
+class FeedForward(nn.Module):
+    """
+    前馈神经网络层，实现Qwen3模型中的MLP模块
+
+    采用门控线性单元（GLU）结构：
+    output = FC3(SiLU(FC1(x)) * FC2(x))
+
+    参数说明：
+    - cfg: 模型配置字典，包含emb_dim（嵌入维度）、hidden_dim（隐藏层维度）、dtype（数据类型）等
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        # 第一个线性层，用于门控信号
+        self.fc1 = nn.Linear(
+            cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
+        # 第二个线性层，用于原始输入转换
+        self.fc2 = nn.Linear(
+            cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
+        # 第三个线性层，用于输出转换
+        self.fc3 = nn.Linear(
+            cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
+
+    def forward(self, x):
+        """
+        前向传播计算
+
+        采用GLU激活函数：SiLU(fc1(x)) * fc2(x)
+
+        参数：
+        - x: 输入张量，形状为(batch_size, seq_len, emb_dim)
+
+        返回：
+        - 输出张量，形状为(batch_size, seq_len, emb_dim)
+        """
+        x_fc1 = self.fc1(x)
+        x_fc2 = self.fc2(x)
+        # 使用SiLU激活函数（Sigmoid Linear Unit）
+        x = nn.functional.silu(x_fc1) * x_fc2
+        return self.fc3(x)
+
+
+class RMSNorm(nn.Module):
+    """
+    RMS（均方根）归一化层
+
+    对输入进行归一化：x = x * scale / sqrt(mean(x^2) + eps)
+    可选添加偏置项（bias）
+
+    参数说明：
+    - emb_dim: 嵌入维度
+    - eps: 防止除零的小常数，默认为1e-6
+    - bias: 是否添加偏置项，默认为False
+    - qwen3_compatible: 是否与Qwen3原生实现兼容，True时将输入转换为float32进行计算
+    """
+
+    def __init__(self, emb_dim, eps=1e-6, bias=False, qwen3_compatible=True):
+        super().__init__()
+        self.eps = eps
+        self.qwen3_compatible = qwen3_compatible
+        # 可学习的缩放参数
+        self.scale = nn.Parameter(torch.ones(emb_dim))
+        # 可学习的偏置参数（可选）
+        self.shift = nn.Parameter(torch.zeros(emb_dim)) if bias else None
+
+    def forward(self, x):
+        """
+        前向传播计算
+
+        计算RMS归一化：x_normalized = x * scale / sqrt(mean(x^2) + eps)
+
+        参数：
+        - x: 输入张量，形状为(batch_size, seq_len, emb_dim)
+
+        返回：
+        - 归一化后的张量，形状与输入相同
+        """
+        input_dtype = x.dtype
+
+        # Qwen3兼容模式：转换为float32进行计算以提高数值稳定性
+        if self.qwen3_compatible:
+            x = x.to(torch.float32)
+
+        # 计算均方根：沿最后一个维度（特征维度）计算平方的均值
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        # 应用归一化：x / sqrt(variance + eps)
+        norm_x = x * torch.rsqrt(variance + self.eps)
+        # 应用可学习的缩放参数
+        norm_x = norm_x * self.scale
+
+        # 如果设置了偏置，添加可学习的偏置项
+        if self.shift is not None:
+            norm_x = norm_x + self.shift
+
+        # 恢复原始数据类型
+        return norm_x.to(input_dtype)
+
+
+def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
+    """
+    计算旋转位置编码（RoPE）的cos和sin参数
+
+    旋转位置编码为每个位置生成旋转角度，将位置信息编码到注意力计算中
+
+    参数：
+    - head_dim: 注意力头维度，必须为偶数
+    - theta_base: 基础频率参数，控制旋转速度，默认为10000
+    - context_length: 上下文长度（最大序列长度）
+    - dtype: 计算数据类型，默认为float32
+
+    返回：
+    - (cos, sin)元组，形状为(context_length, head_dim)
+    """
+    assert head_dim % 2 == 0, "嵌入维度必须为偶数"
+
+    # 计算逆频率：1.0 / (theta_base^(i/head_dim))，i = 0,2,4,...,head_dim-2
+    inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim,
+                      2, dtype=dtype)[: (head_dim // 2)].float() / head_dim))
+
+    # 生成位置索引：0, 1, 2, ..., context_length-1
+    positions = torch.arange(context_length, dtype=dtype)
+
+    # 计算角度：位置索引 × 逆频率
+    # 形状：(context_length, head_dim // 2)
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
+
+    # 扩展角度以匹配完整的头维度：将前一半角度复制到后一半
+    # 形状：(context_length, head_dim)
+    angles = torch.cat([angles, angles], dim=1)
+
+    # 预计算正弦和余弦值
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+
+    return cos, sin
+
+
+def apply_rope(x, cos, sin):
+    """
+    对查询（Q）和键（K）张量应用旋转位置编码（RoPE）
+
+    通过旋转操作将位置信息融合到注意力计算中
+
+    参数：
+    - x: 输入张量，形状为(batch_size, num_heads, seq_len, head_dim)
+    - cos: 余弦参数，形状为(seq_len, head_dim)或(context_length, head_dim)
+    - sin: 正弦参数，形状为(seq_len, head_dim)或(context_length, head_dim)
+
+    返回：
+    - 应用旋转位置编码后的张量，形状与输入相同
+    """
+    # 获取输入形状
+    batch_size, num_heads, seq_len, head_dim = x.shape
+    assert head_dim % 2 == 0, "头维度必须为偶数"
+
+    # 将输入张量分割为前一半和后一半
+    x1 = x[..., : head_dim // 2]  # 前一半
+    x2 = x[..., head_dim // 2:]  # 后一半
+
+    # 调整cos和sin形状以匹配输入：添加批次和头维度
+    # 最终形状：(1, 1, seq_len, head_dim)
+    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)
+    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+
+    # 应用旋转位置编码：旋转后一半并交换位置
+    # 公式：x_rotated = x * cos + rotate(x) * sin
+    # 其中rotate(x) = [-x2, x1]（将x2取负，然后与x1拼接）
+    rotated = torch.cat((-x2, x1), dim=-1)
+    x_rotated = (x * cos) + (rotated * sin)
+
+    # 应用旋转后可以安全地使用较低精度的数据类型
+    return x_rotated.to(dtype=x.dtype)
+
+
+class GroupedQueryAttention(nn.Module):
+    """
+    分组查询注意力机制(GQA)模块
+
+    Qwen3采用分组查询注意力机制来平衡计算效率和模型性能。
+    在GQA中，所有的查询头(Q)都被计算，但键(K)和值(V)被分组共享，
+    这减少了内存使用和计算量，同时保持了注意力机制的表达能力。
+
+    Args:
+        d_in: 输入维度
+        num_heads: 查询头的数量
+        num_kv_groups: 键值组的数量，num_heads必须能被num_kv_groups整除
+        head_dim: 每个头的维度，如果为None则自动计算为d_in // num_heads
+        qk_norm: 是否对查询和键进行归一化
+        dtype: 权重数据类型
+    """
+
+    def __init__(
+        self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None
+    ):
+        super().__init__()
+        assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
+
+        self.num_heads = num_heads
+        self.num_kv_groups = num_kv_groups
+        self.group_size = num_heads // num_kv_groups  # 每个键值组服务的查询头数量
+
+        if head_dim is None:
+            assert d_in % num_heads == 0, "`d_in` must be divisible by `num_heads` if `head_dim` is not set"
+            head_dim = d_in // num_heads
+
+        self.head_dim = head_dim
+        self.d_out = num_heads * head_dim  # 输出维度
+
+        # 查询、键、值投影层
+        self.W_query = nn.Linear(d_in, self.d_out, bias=False, dtype=dtype)
+        self.W_key = nn.Linear(d_in, num_kv_groups *
+                               head_dim, bias=False, dtype=dtype)
+        self.W_value = nn.Linear(
+            d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
+
+        self.out_proj = nn.Linear(self.d_out, d_in, bias=False, dtype=dtype)
+
+        # 可选的查询-键归一化（Qwen3推理模型使用）
+        if qk_norm:
+            self.q_norm = RMSNorm(head_dim, eps=1e-6)
+            self.k_norm = RMSNorm(head_dim, eps=1e-6)
+        else:
+            self.q_norm = self.k_norm = None
+
+    def forward(self, x, mask, cos, sin):
+        """
+        前向传播
+
+        Args:
+            x: 输入张量，形状为(batch_size, num_tokens, emb_dim)
+            mask: 注意力掩码，防止关注未来的token
+            cos: RoPE旋转位置编码的余弦参数
+            sin: RoPE旋转位置编码的正弦参数
+
+        Returns:
+            注意力输出，形状为(batch_size, num_tokens, emb_dim)
+        """
+        b, num_tokens, _ = x.shape
+
+        # 应用投影得到查询、键、值
+        queries = self.W_query(x)  # (b, num_tokens, num_heads * head_dim)
+        keys = self.W_key(x)       # (b, num_tokens, num_kv_groups * head_dim)
+        values = self.W_value(x)   # (b, num_tokens, num_kv_groups * head_dim)
+
+        # 重塑张量以分离注意力头
+        queries = queries.view(b, num_tokens, self.num_heads,
+                               self.head_dim).transpose(1, 2)
+        keys = keys.view(b, num_tokens, self.num_kv_groups,
+                         self.head_dim).transpose(1, 2)
+        values = values.view(b, num_tokens, self.num_kv_groups,
+                             self.head_dim).transpose(1, 2)
+
+        # 可选的查询和键归一化
+        if self.q_norm:
+            queries = self.q_norm(queries)
+        if self.k_norm:
+            keys = self.k_norm(keys)
+
+        # 应用旋转位置编码(RoPE)
+        queries = apply_rope(queries, cos, sin)
+        keys = apply_rope(keys, cos, sin)
+
+        # 扩展键和值以匹配查询头的数量
+        # 这是GQA的核心：每个键值组为多个查询头服务
+        keys = keys.repeat_interleave(self.group_size, dim=1)
+        values = values.repeat_interleave(self.group_size, dim=1)
+
+        # 注意力计算
+        attn_scores = queries @ keys.transpose(2, 3)  # 点积注意力分数
+        attn_scores = attn_scores.masked_fill(mask, -torch.inf)  # 应用掩码
+        attn_weights = torch.softmax(
+            attn_scores / self.head_dim**0.5, dim=-1)  # softmax归一化
+
+        # 加权求和得到上下文表示
+        context = (attn_weights @ values).transpose(1,
+                                                    2).reshape(b, num_tokens, self.d_out)
+        return self.out_proj(context)
+
+
+class TransformerBlock(nn.Module):
+    """
+    Transformer块，包含一个自注意力层和一个前馈网络层
+
+    这是Qwen3的核心构建块，采用残差连接和层归一化来稳定训练。
+    每个块包含一个分组查询注意力层和一个前馈网络层。
+
+    Args:
+        cfg: 模型配置字典
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.att = GroupedQueryAttention(
+            d_in=cfg["emb_dim"],
+            num_heads=cfg["n_heads"],
+            head_dim=cfg["head_dim"],
+            num_kv_groups=cfg["n_kv_groups"],
+            qk_norm=cfg["qk_norm"],
+            dtype=cfg["dtype"]
+        )
+        self.ff = FeedForward(cfg)
+        self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)  # 注意力前的层归一化
+        self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)  # 前馈网络前的层归一化
+
+    def forward(self, x, mask, cos, sin):
+        """
+        前向传播
+
+        Args:
+            x: 输入张量
+            mask: 注意力掩码
+            cos: RoPE余弦参数
+            sin: RoPE正弦参数
+
+        Returns:
+            处理后的张量
+        """
+        # 注意力块的残差连接
+        shortcut = x
+        x = self.norm1(x)  # 预归一化
+        # 形状 [batch_size, num_tokens, emb_size]
+        x = self.att(x, mask, cos, sin)
+        x = x + shortcut  # 残差连接：将原始输入加回
+
+        # 前馈网络块的残差连接
+        shortcut = x
+        x = self.norm2(x)  # 预归一化
+        x = self.ff(x)
+        x = x + shortcut  # 残差连接：将原始输入加回
+
+        return x
+
+
+class Qwen3Model(nn.Module):
+    """
+    Qwen3语言模型主类
+
+    实现了完整的Qwen3 Transformer架构，包含以下组件：
+    1. 词嵌入层：将token索引映射为向量表示
+    2. Transformer块序列：多层Transformer编码器
+    3. 最终归一化层：RMSNorm归一化
+    4. 输出头：线性层输出词汇表概率分布
+    5. 旋转位置编码：RoPE位置编码参数
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+
+        # Main model parameters
+        # 词嵌入层：将离散的单词（token）ID转换为连续的向量表示
+        # 输入：整数类型的token ID（例如，"hello"对应的ID可能是1234）
+        # 输出：浮点数类型的向量表示（例如，每个token转换为768维的向量）
+        self.tok_emb = nn.Embedding(
+            cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
+
+        # Transformer blocks
+        self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
+            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
+        )
+
+        self.final_norm = RMSNorm(cfg["emb_dim"])
+        self.out_head = nn.Linear(
+            cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
+
+        # Reusable utilities
+        if cfg["head_dim"] is None:
+            head_dim = cfg["emb_dim"] // cfg["n_heads"]
+        else:
+            head_dim = cfg["head_dim"]
+        cos, sin = compute_rope_params(
+            head_dim=head_dim,
+            theta_base=cfg["rope_base"],
+            context_length=cfg["context_length"]
+        )
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+        self.cfg = cfg
+
+    def forward(self, in_idx):
+        """
+        前向传播函数
+
+        Args:
+            in_idx: 输入token索引张量，形状为[batch_size, seq_len]
+
+        Returns:
+            logits: 输出词汇表概率分布，形状为[batch_size, seq_len, vocab_size]
+
+        流程：
+        1. 词嵌入：将token索引转换为向量表示
+        2. 自注意力掩码：创建因果注意力掩码（上三角矩阵）
+        3. 多层Transformer处理：依次通过所有Transformer块
+        4. 最终归一化：应用RMSNorm归一化
+        5. 输出投影：线性变换得到词汇表概率分布
+        """
+        # Forward pass
+        tok_embeds = self.tok_emb(in_idx)
+        x = tok_embeds
+
+        num_tokens = x.shape[1]
+        mask = torch.triu(torch.ones(num_tokens, num_tokens,
+                          device=x.device, dtype=torch.bool), diagonal=1)
+
+        for block in self.trf_blocks:
+            x = block(x, mask, self.cos, self.sin)
+        x = self.final_norm(x)
+        logits = self.out_head(x.to(self.cfg["dtype"]))
+        return logits
+
+
+# # 2. Initialize model
+def load_model_config(model_name: str, config_path: str = None) -> dict:
+    """
+    从JSON配置文件加载模型配置
+
+    该函数负责从指定的JSON配置文件中加载特定模型的配置参数。
+    支持从默认配置文件model_config.json或自定义路径加载。
+
+    Args:
+        model_name: 模型名称，支持以下选项：
+                    "0.6B", "1.7B", "4B", "8B", "14B", "32B"
+        config_path: 配置文件路径，如果为None则使用默认的model_config.json
+
+    Returns:
+        模型配置字典，包含所有必要的模型参数
+
+    Raises:
+        ValueError: 如果指定的模型名称不在支持列表中
+        FileNotFoundError: 如果配置文件不存在
+        json.JSONDecodeError: 如果配置文件格式错误
+
+    示例:
+        >>> config = load_model_config("4B")
+        >>> print(config["emb_dim"])  # 输出：4096
+    """
+    if config_path is None:
+        config_path = MODEL_CONFIG_PATH
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        all_configs = json.load(f)
+
+    if model_name not in all_configs:
+        raise ValueError(
+            f"模型 '{model_name}' 不支持。支持的模型: {list(all_configs.keys())}")
+
+    config = all_configs[model_name]
+
+    # 将字符串类型的dtype转换为torch.dtype
+    # 配置文件中的dtype通常是字符串，需要转换为实际的torch数据类型
+    dtype_str = config.get("dtype", "torch.bfloat16")
+    dtype_map = {
+        "torch.bfloat16": torch.bfloat16,
+        "torch.float16": torch.float16,
+        "torch.float32": torch.float32,
+    }
+    config["dtype"] = dtype_map.get(dtype_str, torch.bfloat16)
+
+    return config
+
+
+def get_device() -> torch.device:
+    """
+    获取可用的计算设备
+
+    该函数根据当前系统的硬件情况自动选择最佳的计算设备。
+    优先级：CUDA (NVIDIA GPU) > MPS (Apple Silicon) > CPU
+
+    Returns:
+        torch.device: 可用的计算设备，按优先级选择
+                    - cuda: NVIDIA GPU
+                    - mps: Apple Silicon (Metal Performance Shaders)
+                    - cpu: 中央处理器
+
+    注意:
+        - 当CUDA可用时，默认选择cuda:0设备
+        - 对于Apple Silicon Mac，MPS提供GPU加速
+        - 如果都没有，则回退到CPU
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
+def initialize_model(config: dict, device: torch.device = None) -> Qwen3Model:
+    """
+    初始化Qwen3模型
+
+    该函数根据给定的配置创建并初始化Qwen3模型实例。
+    主要包括以下步骤：
+    1. 设置随机种子以保证结果可复现
+    2. 根据配置创建Qwen3Model实例
+    3. 将模型移动到指定计算设备（或自动选择设备）
+
+    Args:
+        config: 模型配置字典，包含所有必要的模型参数
+                必须包含：vocab_size, emb_dim, n_layers, n_heads等
+        device: 计算设备，如果为None则自动通过get_device()选择
+
+    Returns:
+        初始化后的Qwen3Model实例，已移动到指定设备上
+
+    注意:
+        - 使用torch.manual_seed(123)保证可复现性
+        - 如果设备未指定，会自动选择最佳可用设备
+        - 模型会立即调用.to(device)方法移动到目标设备
+
+    示例:
+        >>> config = load_model_config("4B")
+        >>> device = get_device()
+        >>> model = initialize_model(config, device)
+    """
+    torch.manual_seed(123)
+    model = Qwen3Model(config)
+
+    if device is None:
+        device = get_device()
+
+    model.to(device)
+    return model
+
+
+def print_model_info(model: Qwen3Model):
+    """
+    打印模型信息，包括参数数量和内存占用
+
+    该函数分析模型结构并输出详细的信息，包括：
+    1. 总参数数量（包括共享权重）
+    2. 唯一参数数量（排除共享权重）
+    3. 不同精度下的内存占用估计
+
+    Args:
+        model: Qwen3Model实例，必须已经初始化
+
+    注意:
+        - 总参数数量：模型所有参数的总和
+        - 唯一参数数量：考虑权重共享（如词嵌入层和输出层）后的实际参数
+        - 内存占用：根据参数数量和数据类型计算的理论内存需求
+        - 实际内存使用可能因优化和缓存而有所不同
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total number of parameters: {total_params:,}")
+
+    # Account for weight tying - 处理权重共享
+    # 在Qwen3模型中，词嵌入层和输出层通常共享权重
+    # 这减少了实际需要存储的参数数量
+    total_params_normalized = total_params - model.tok_emb.weight.numel()
+    print(f"\nTotal number of unique parameters: {total_params_normalized:,}")
+
+    # 计算并打印不同精度下的内存需求
+    # float32: PyTorch默认精度，4字节/参数
+    # bfloat16: 半精度，2字节/参数，支持现代GPU
+    print(
+        f"\nfloat32 (PyTorch default): {model_memory_size(model, input_dtype=torch.float32):.2f} GB")
+    print(
+        f"bfloat16: {model_memory_size(model, input_dtype=torch.bfloat16):.2f} GB")
+
+
+def model_memory_size(model, input_dtype=torch.float32):
+    """
+    计算模型内存占用大小
+
+    该函数计算PyTorch模型在不同精度下的理论内存需求。
+    内存计算包括三部分：
+    1. 模型参数：模型所有权重的数量
+    2. 梯度：反向传播时需要的梯度存储（仅计算需要梯度的参数）
+    3. 缓冲区：模型中的缓存和统计信息（如批归一化统计量）
+
+    Args:
+        model: PyTorch模型，必须是torch.nn.Module的子类
+        input_dtype: 计算内存使用的数据类型，影响每个参数占用的字节数
+                    - torch.float32: 4字节/参数（单精度）
+                    - torch.bfloat16: 2字节/参数（半精度，现代GPU支持）
+                    - torch.float16: 2字节/参数（半精度）
+
+    Returns:
+        模型内存占用大小，单位为GB
+
+    注意:
+        - 这是理论计算值，实际内存使用可能因以下因素而不同：
+          1. 内存对齐和填充
+          2. 优化器状态（如Adam的动量和方差）
+          3. 激活值内存（forward过程中间结果）
+          4. 系统内存管理策略
+        - 对于大模型，使用bfloat16可以节省约50%内存
+        - 梯度只计算需要训练的参数，冻结参数不计算梯度
+
+    计算过程:
+        1. 统计参数数量：遍历所有参数，计算元素总数
+        2. 统计梯度数量：只计算requires_grad=True的参数
+        3. 统计缓冲区数量：所有缓冲区（如RMSNorm的统计量）
+        4. 根据数据类型计算元素大小：
+           - float32: 4字节
+           - bfloat16/float16: 2字节
+        5. 总内存 = (参数+梯度+缓冲区) × 元素大小
+        6. 转换为GB：除以1024^3
+    """
+    # 计算参数总数：遍历模型所有参数，统计元素数量
+    total_params = 0
+    total_grads = 0
+    for param in model.parameters():
+        param_size = param.numel()  # 当前参数的元素数量
+        total_params += param_size
+        if param.requires_grad:
+            total_grads += param_size  # 只统计需要训练参数的梯度
+
+    # 统计缓冲区：模型中的缓存和统计信息（如RMSNorm的统计量）
+    total_buffers = sum(buf.numel() for buf in model.buffers())
+
+    # 获取数据类型的元素大小（字节/元素）
+    element_size = torch.tensor(0, dtype=input_dtype).element_size()
+
+    # 计算总内存字节数：参数 + 梯度 + 缓冲区
+    total_memory_bytes = (total_params + total_grads +
+                          total_buffers) * element_size
+
+    # 转换为GB：1GB = 1024^3 字节
+    total_memory_gb = total_memory_bytes / (1024**3)
+    return total_memory_gb
+
+
+# # 4. Load pretrained weights
+def load_weights_into_qwen(model, param_config, params):
+    """
+    将预训练权重加载到Qwen3模型中
+
+    这个函数负责将HuggingFace格式的预训练权重加载到自定义的Qwen3模型架构中。
+    它按照层次结构逐层匹配权重名称，确保权重正确加载到对应的模型参数中。
+
+    Args:
+        model: Qwen3Model实例，需要加载权重的目标模型
+        param_config: 模型配置字典，包含模型的结构参数
+        params: 预训练权重字典，包含从HuggingFace下载的权重数据
+
+    Raises:
+        ValueError: 当权重形状不匹配时抛出异常
+    """
+    def assign(left, right, tensor_name="unknown"):
+        """
+        辅助函数：将右侧权重赋值给左侧参数
+
+        Args:
+            left: 模型参数张量（目标）
+            right: 预训练权重张量（源）
+            tensor_name: 权重名称，用于错误信息
+
+        Returns:
+            赋值后的左侧张量
+        """
+        if left.shape != right.shape:
+            raise ValueError(
+                f"Shape mismatch in tensor '{tensor_name}'. Left: {left.shape}, Right: {right.shape}")
+
+        with torch.no_grad():
+            if isinstance(right, torch.Tensor):
+                left.copy_(right)
+            else:
+                left.copy_(torch.as_tensor(
+                    right, dtype=left.dtype, device=left.device))
+
+        return left
+
+    # 加载词嵌入权重
+    model.tok_emb.weight = assign(
+        model.tok_emb.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
+
+    # 逐层加载Transformer块的权重
+    for l in range(param_config["n_layers"]):
+        block = model.trf_blocks[l]
+        att = block.att
+
+        # Q, K, V投影权重
+        att.W_query.weight = assign(
+            att.W_query.weight,
+            params[f"model.layers.{l}.self_attn.q_proj.weight"],
+            f"model.layers.{l}.self_attn.q_proj.weight"
+        )
+        att.W_key.weight = assign(
+            att.W_key.weight,
+            params[f"model.layers.{l}.self_attn.k_proj.weight"],
+            f"model.layers.{l}.self_attn.k_proj.weight"
+        )
+        att.W_value.weight = assign(
+            att.W_value.weight,
+            params[f"model.layers.{l}.self_attn.v_proj.weight"],
+            f"model.layers.{l}.self_attn.v_proj.weight"
+        )
+
+        # 输出投影权重
+        att.out_proj.weight = assign(
+            att.out_proj.weight,
+            params[f"model.layers.{l}.self_attn.o_proj.weight"],
+            f"model.layers.{l}.self_attn.o_proj.weight"
+        )
+
+        # QK归一化权重（如果启用）
+        if hasattr(att, "q_norm") and att.q_norm is not None:
+            att.q_norm.scale = assign(
+                att.q_norm.scale,
+                params[f"model.layers.{l}.self_attn.q_norm.weight"],
+                f"model.layers.{l}.self_attn.q_norm.weight"
+            )
+        if hasattr(att, "k_norm") and att.k_norm is not None:
+            att.k_norm.scale = assign(
+                att.k_norm.scale,
+                params[f"model.layers.{l}.self_attn.k_norm.weight"],
+                f"model.layers.{l}.self_attn.k_norm.weight"
+            )
+
+        # 注意力层归一化权重
+        block.norm1.scale = assign(
+            block.norm1.scale,
+            params[f"model.layers.{l}.input_layernorm.weight"],
+            f"model.layers.{l}.input_layernorm.weight"
+        )
+
+        # 前馈网络权重
+        block.ff.fc1.weight = assign(
+            block.ff.fc1.weight,
+            params[f"model.layers.{l}.mlp.gate_proj.weight"],
+            f"model.layers.{l}.mlp.gate_proj.weight"
+        )
+        block.ff.fc2.weight = assign(
+            block.ff.fc2.weight,
+            params[f"model.layers.{l}.mlp.up_proj.weight"],
+            f"model.layers.{l}.mlp.up_proj.weight"
+        )
+        block.ff.fc3.weight = assign(
+            block.ff.fc3.weight,
+            params[f"model.layers.{l}.mlp.down_proj.weight"],
+            f"model.layers.{l}.mlp.down_proj.weight"
+        )
+        block.norm2.scale = assign(
+            block.norm2.scale,
+            params[f"model.layers.{l}.post_attention_layernorm.weight"],
+            f"model.layers.{l}.post_attention_layernorm.weight"
+        )
+
+    # 最终层归一化和输出头权重
+    model.final_norm.scale = assign(
+        model.final_norm.scale, params["model.norm.weight"], "model.norm.weight")
+
+    # 语言模型头权重（如果存在）
+    if "lm_head.weight" in params:
+        model.out_head.weight = assign(
+            model.out_head.weight, params["lm_head.weight"], "lm_head.weight")
+    else:
+        # 使用权重共享：输出头权重与词嵌入权重相同
+        model.out_head.weight = model.tok_emb.weight
+        print("Model uses weight tying.")
+
+
+def download_and_load_weights(model: Qwen3Model, config: dict, model_name: str,
+                              use_base_model: bool = False, device: torch.device = None):
+    """
+    下载并加载预训练权重
+
+    这个函数负责从HuggingFace Hub下载预训练权重，并根据模型大小和类型
+    选择合适的下载策略（单文件或多分片），然后将权重加载到模型中。
+
+    Args:
+        model: Qwen3Model实例，需要加载权重的目标模型
+        config: 模型配置字典
+        model_name: 模型名称，如 "4B"，用于确定下载路径和权重文件
+        use_base_model: 是否使用基础模型（True）还是指令调优模型（False）
+        device: 计算设备，用于将模型移动到指定设备
+
+    Returns:
+        tuple: (repo_id, local_dir) - HuggingFace仓库ID和本地下载目录
+    """
+    # 确定HuggingFace仓库ID
+    if use_base_model:
+        repo_id = f"Qwen/Qwen3-{model_name}-Base"
+    else:
+        repo_id = f"Qwen/Qwen3-{model_name}"
+
+    local_dir = Path(repo_id).parts[-1]
+
+    # 根据模型大小选择下载策略
+    if model_name == "0.6B":
+        # 0.6B模型使用单文件权重
+        weights_file = hf_hub_download(
+            repo_id=repo_id,
+            filename="model.safetensors",
+            local_dir=local_dir,
+        )
+        weights_dict = load_file(weights_file)
+    else:
+        # 较大模型使用分片权重
+        repo_dir = snapshot_download(repo_id=repo_id, local_dir=local_dir)
+        index_path = os.path.join(repo_dir, "model.safetensors.index.json")
+        with open(index_path, "r") as f:
+            index = json.load(f)
+
+        weights_dict = {}
+        for filename in set(index["weight_map"].values()):
+            shard_path = os.path.join(repo_dir, filename)
+            shard = load_file(shard_path)
+            weights_dict.update(shard)
+
+    # 将权重加载到模型中
+    load_weights_into_qwen(model, config, weights_dict)
+
+    # 将模型移动到指定设备
+    if device is None:
+        device = get_device()
+    model.to(device)
+    # 释放权重字典以节省内存
+    del weights_dict
+
+    return repo_id, local_dir
+
+
+# # 4. Load tokenizer
+class Qwen3Tokenizer:
+    """Qwen3分词器"""
+    _SPECIALS = [
+        "<|endoftext|>",
+        "<|im_start|>", "<|im_end|>",
+        "<|object_ref_start|>", "<|object_ref_end|>",
+        "<|box_start|>", "<|box_end|>",
+        "<|quad_start|>", "<|quad_end|>",
+        "<|vision_start|>", "<|vision_end|>",
+        "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
+        "<think>", "</think>"
+    ]
+    _SPLIT_RE = re.compile(r"(<\|[^>]+?\|>|<think>|</think>)")
+
+    def __init__(self, tokenizer_file_path="tokenizer.json", repo_id=None,
+                 apply_chat_template=True, add_generation_prompt=False, add_thinking=False):
+
+        self.apply_chat_template = apply_chat_template
+        self.add_generation_prompt = add_generation_prompt
+        self.add_thinking = add_thinking
+
+        tok_file = Path(tokenizer_file_path)
+        self._tok = Tokenizer.from_file(str(tok_file))
+        self._special_to_id = {}
+        for t in self._SPECIALS:
+            tid = self._tok.token_to_id(t)
+            if tid is not None:
+                self._special_to_id[t] = tid
+
+        self.pad_token_id = self._special_to_id["<|endoftext|>"]
+        self.eos_token_id = self.pad_token_id
+
+        if repo_id and "Base" not in repo_id:
+            eos_token = "<|im_end|>"
+        else:
+            eos_token = "\<|endoftext|\>"
+        if eos_token in self._special_to_id:
+            self.eos_token_id = self._special_to_id[eos_token]
+
+    def encode(self, text, chat_wrapped=None):
+        if chat_wrapped is None:
+            chat_wrapped = self.apply_chat_template
+
+        stripped = text.strip()
+        if stripped in self._special_to_id and "\n" not in stripped:
+            return [self._special_to_id[stripped]]
+
+        if chat_wrapped:
+            text = self._wrap_chat(text)
+
+        ids = []
+        for part in filter(None, self._SPLIT_RE.split(text)):
+            if part in self._special_to_id:
+                ids.append(self._special_to_id[part])
+            else:
+                ids.extend(self._tok.encode(part).ids)
+        return ids
+
+    def decode(self, ids):
+        return self._tok.decode(ids, skip_special_tokens=False)
+
+    def _wrap_chat(self, user_msg):
+        s = f"<|im_start|>user\n{user_msg}<|im_end|>\n"
+        if self.add_generation_prompt:
+            s += "<|im_start|>assistant"
+            if self.add_thinking:
+                s += "\n"
+            else:
+                s += "\n<think>\n\n</think>\n\n"
+        return s
+
+
+def load_tokenizer(model_name: str, repo_id: str, local_dir: str,
+                   use_base_model: bool = False,
+                   use_reasoning_model: bool = False,
+                   use_instruct_model: bool = False) -> Qwen3Tokenizer:
+    """
+    加载Qwen3分词器
+
+    该函数根据模型类型从HuggingFace下载并初始化相应的分词器。
+    支持基础模型、推理模型和指令模型的不同配置。
+
+    Args:
+        model_name: 模型名称，如 "4B"
+        repo_id: HuggingFace仓库ID，用于下载分词器文件
+        local_dir: 本地目录，用于存储下载的分词器文件
+        use_base_model: 是否使用基础模型（不应用聊天模板）
+        use_reasoning_model: 是否使用推理模型（应用聊天模板和思考提示）
+        use_instruct_model: 是否使用指令模型（应用聊天模板）
+
+    Returns:
+        Qwen3Tokenizer实例，配置了相应的聊天模板和提示设置
+
+    Raises:
+        如果无法下载分词器文件，会抛出相关异常
+    """
+    # 根据模型类型确定分词器文件路径
+    if use_reasoning_model or use_instruct_model:
+        tokenizer_file_path = f"Qwen3-{model_name}/tokenizer.json"
+    else:
+        tokenizer_file_path = f"Qwen3-{model_name}-Base/tokenizer.json"
+
+    # 从HuggingFace下载分词器文件
+    hf_hub_download(
+        repo_id=repo_id,
+        filename="tokenizer.json",
+        local_dir=local_dir,
+    )
+
+    # 根据模型类型配置不同的分词器参数
+    if use_reasoning_model or use_instruct_model:
+        # 推理模型和指令模型：应用聊天模板和生成提示
+        tokenizer = Qwen3Tokenizer(
+            tokenizer_file_path=tokenizer_file_path,
+            repo_id=repo_id,
+            apply_chat_template=True,
+            add_generation_prompt=True,
+            add_thinking=use_reasoning_model  # 推理模型需要思考提示
+        )
+    else:
+        # 基础模型：不应用聊天模板
+        tokenizer = Qwen3Tokenizer(
+            tokenizer_file_path=tokenizer_file_path,
+            repo_id=repo_id,
+            apply_chat_template=False,
+            add_generation_prompt=False,
+            add_thinking=False
+        )
+
+    return tokenizer
+
+
+# # 5. Generate text
+def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
+    """
+    流式生成文本，以token-by-token方式生成模型响应
+
+    该函数使用自回归方式逐token生成文本，支持早停（遇到结束token时停止）
+    和流式输出，适合实时显示生成结果
+
+    Args:
+        model: Qwen3Model实例，用于前向传播
+        token_ids: 输入token IDs张量，形状为(batch_size, seq_len)
+        max_new_tokens: 最大生成token数，控制生成长度
+        eos_token_id: 结束token ID，遇到此token时停止生成（可选）
+
+    Yields:
+        生成的下一个token张量，形状为(batch_size, 1)
+
+    工作原理：
+        1. 将模型设置为评估模式
+        2. 循环最多max_new_tokens次
+        3. 每次取最后一个token的logits
+        4. 使用argmax选择概率最高的token
+        5. 如果遇到eos_token_id则提前停止
+        6. 生成token并更新输入序列
+    """
+    model.eval()
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            # 获取最后一个位置的logits（仅关注当前步的预测）
+            out = model(token_ids)[:, -1]
+            # 选择概率最高的token（贪婪解码）
+            next_token = torch.argmax(out, dim=-1, keepdim=True)
+
+            # 如果设置了结束token并且当前生成的就是结束token，则停止
+            if (eos_token_id is not None
+                    and torch.all(next_token == eos_token_id)):
+                break
+
+            # 生成token
+            yield next_token
+
+            # 将新token添加到输入序列中，用于下一轮生成
+            token_ids = torch.cat([token_ids, next_token], dim=1)
+
+
+def generate_response(model: Qwen3Model, tokenizer: Qwen3Tokenizer,
+                      prompt: str, device: torch.device,
+                      max_new_tokens: int = 4096):
+    """
+    生成模型响应，封装完整的文本生成流程
+
+    该函数将用户输入转换为token，使用模型生成响应，
+    并实时显示生成的文本，提供完整的用户交互体验
+
+    Args:
+        model: Qwen3Model实例，已加载权重的模型
+        tokenizer: Qwen3Tokenizer实例，用于编码和解码
+        prompt: 用户输入提示文本
+        device: 计算设备（cuda/mps/cpu）
+        max_new_tokens: 最大生成token数，默认4096
+
+    工作流程：
+        1. 使用分词器将用户输入编码为token IDs
+        2. 将token IDs转换为张量并发送到设备
+        3. 显示提示信息和响应开始提示
+        4. 使用流式生成器逐token生成文本
+        5. 实时解码并显示每个生成的token
+        6. 生成完成后换行
+    """
+    # 将用户输入编码为token IDs
+    input_token_ids = tokenizer.encode(prompt)
+    print(f"Input token IDs: {input_token_ids}")
+    # 转换为张量并添加批次维度，发送到计算设备
+    input_token_ids_tensor = torch.tensor(
+        input_token_ids, device=device).unsqueeze(0)
+
+    # 显示用户输入和生成开始
+    print(f"\n{'='*50}")
+    print(f"Prompt: {prompt}")
+    print(f"{'='*50}")
+    print("Response:")
+
+    # 使用流式生成器逐token生成文本
+    for token in generate_text_basic_stream(
+        model=model,
+        token_ids=input_token_ids_tensor,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id
+    ):
+        # 从张量中提取token ID并转换为列表
+        token_id = token.squeeze(0).tolist()
+        # 解码并实时显示token文本
+        print(
+            tokenizer.decode(token_id),
+            end="",
+            flush=True
+        )
+    print("\n")
+
+
+# # 6. Main function
+def main(model_name: str = "4B",
+         use_base_model: bool = False,
+         use_reasoning_model: bool = True,
+         use_instruct_model: bool = False,
+         prompt: str = "你好",
+         max_new_tokens: int = 4096):
+    """
+    主函数：加载模型、分词器并生成文本
+
+    Args:
+        model_name: 模型名称，支持 "0.6B", "1.7B", "4B", "8B", "14B", "32B"
+        use_base_model: 是否使用基础模型
+        use_reasoning_model: 是否使用推理模型
+        use_instruct_model: 是否使用指令模型
+        prompt: 用户输入提示
+        max_new_tokens: 最大生成token数
+
+    Returns:
+        model, tokenizer, config, device: 返回模型、分词器、配置和设备的元组
+    """
+    # 验证模型类型选择
+    if (use_base_model + use_reasoning_model + use_instruct_model) != 1:
+        raise AttributeError(
+            "Only one of the options (use_base_model, use_reasoning_model, use_instruct_model) can be True.")
+
+    print(f"\n{'#'*60}")
+    print(f"# Qwen3 Model: {model_name}")
+    print(
+        f"# Mode: {'Base' if use_base_model else 'Reasoning' if use_reasoning_model else 'Instruct'}")
+    print(f"{'#'*60}\n")
+
+    # Step 1: 加载模型配置
+    print("[1/5] Loading model configuration...")
+    config = load_model_config(model_name)
+    print(f"      Model config loaded: {model_name}")
+
+    # Step 2: 获取设备
+    print("[2/5] Getting compute device...")
+    device = get_device()
+    print(f"      Using device: {device}")
+
+    # Step 3: 初始化模型
+    print("[3/5] Initializing model...")
+    model = initialize_model(config, device)
+    print_model_info(model)
+
+    # Step 4: 下载并加载预训练权重
+    print("\n[4/5] Downloading and loading pretrained weights...")
+    repo_id, local_dir = download_and_load_weights(
+        model=model,
+        config=config,
+        model_name=model_name,
+        use_base_model=use_base_model,
+        device=device
+    )
+    print(f"      Weights loaded from: {repo_id}")
+
+    # Step 5: 加载分词器
+    print("\n[5/5] Loading tokenizer...")
+    tokenizer = load_tokenizer(
+        model_name=model_name,
+        repo_id=repo_id,
+        local_dir=local_dir,
+        use_base_model=use_base_model,
+        use_reasoning_model=use_reasoning_model,
+        use_instruct_model=use_instruct_model
+    )
+    print("      Tokenizer loaded successfully!")
+
+    # 生成响应
+    print("\n" + "="*60)
+    print("Starting text generation...")
+    print("="*60)
+    generate_response(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        device=device,
+        max_new_tokens=max_new_tokens
+    )
+
+    return model, tokenizer, config, device
+
+
+if __name__ == "__main__":
+    # 配置参数 - 可以修改这些参数来选择不同的模型和模式
+    CHOOSE_MODEL = "4B"  # 可选: "0.6B", "1.7B", "4B", "8B", "14B", "32B"
+    USE_BASE_MODEL = False      # 使用基础模型
+    USE_REASONING_MODEL = True  # 使用推理模型
+    USE_INSTRUCT_MODEL = False  # 使用指令模型
+
+    # 用户输入提示
+    PROMPT = input("Enter your prompt: ")  # 或者直接设置: PROMPT = "你好"
+
+    # 运行主函数
+    model, tokenizer, config, device = main(
+        model_name=CHOOSE_MODEL,
+        use_base_model=USE_BASE_MODEL,
+        use_reasoning_model=USE_REASONING_MODEL,
+        use_instruct_model=USE_INSTRUCT_MODEL,
+        prompt=PROMPT,
+        max_new_tokens=4096
+    )
