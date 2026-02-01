@@ -1216,18 +1216,18 @@ def main(model_name: str = "0.6B",
                 device=device,
                 max_new_tokens=max_new_tokens
             )
-
-    prompt = input("Enter your prompt: ")
-    print("\n" + "="*60)
-    print("Starting text generation...")
-    print("="*60)
-    generate_response(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        device=device,
-        max_new_tokens=max_new_tokens
-    )
+    else:
+        prompt = input("Enter your prompt: ")
+        print("\n" + "="*60)
+        print("Starting text generation...")
+        print("="*60)
+        generate_response(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            device=device,
+            max_new_tokens=max_new_tokens
+        )
 
     return model, tokenizer, config, device
 
